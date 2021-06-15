@@ -2,6 +2,13 @@
 
     GetSrcValueWithType() and SimpleCodegenBasicBlock() are the interesting functions.
 
+
+    Can be built with something like:
+    windows:
+        g++ -std=c++11 -I %VULKAN_SDK%\Include -I %VULKAN_SDK%\Include\spirv-headers *.cpp
+    linux:
+        g++ -std=c++11 -I $VULKAN_SDK/Include -I $VULKAN_SDK$/Include/spirv-headers *.cpp -ldl
+
 **/
 
 #include <stdio.h>
@@ -14,8 +21,7 @@
 
 #include "Array.h"
 
-// VULKAN_SDK=C:\VulkanSDK\1.2.148.1
-// %VULKAN_SDK%\Include\spirv-headers
+#include "SpirvRunner.h"
 
 #include <spirv.h>
 #include <GLSL.std.450.h>
@@ -667,8 +673,7 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
         code.push_initlist({
             SpvOpTypeImage | 9 << 16, m.uav_image_type_ids[0], FixedSpvId_TypeGenInt32,
             SpvDimBuffer, 0, 0, // dim, "depth", arrayed
-            0, 2, SpvImageFormatUnknown, // MS, "sampled", actual VkImageViewFormat
-            // need capability kernal for operand[9] of OpTypeImage, so can't explicitly say SpvAccessQualifierWriteOnly, but maybe don't need.
+            0, 2, SpvImageFormatR32ui, // MS, "sampled", actual VkImageViewFormat
         });
         const SpvId ptr_type_id = m.AllocId();
         code.push_initlist({ SpvOpTypePointer | 4 << 16, ptr_type_id, uint32_t(storageClass), uavImageTypeId });
@@ -698,6 +703,7 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
     code[3] = m.GetBound();
 
     {
+        printf("\nwriting spirv to [file]=[%s]\n", filename);
         FILE *fp = fopen(filename, "wb");
         if (fp) {
             const size_t nbytes = code.size() * sizeof(uint32_t);
@@ -708,6 +714,41 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
         }
         else {
             perror("fopen");
+        }
+    }
+
+    {
+        auto const GetValue = [](uint x) -> uint {
+	        // All these bools can stay as bools in spirv...
+	        bool cond0 = x < 32u;
+	        bool cond1 = (x & 4) == 0;
+	        bool orResult = cond0 || cond1;
+	        uint val = orResult ? 1000 : 2000;
+	        val += x;
+	        // ...but also test using bools as {0, -1} int values work:
+	        val ^= -int((x & 2) == 0);
+            return val;
+        };
+
+        puts("\n\n  running the spirv...\n");
+        if (SpirvRunner *runner = NewSpirvRunner()) {
+            const uint32_t *data = RunSimpleCompute(runner, code.data(), code.size() * sizeof(uint32_t));
+
+            bool okay = true;
+            for (uint x = 0; x < 64; ++x) {
+                uint32_t const got = data[x];
+                uint32_t const expected = GetValue(x);
+                if (got != expected) {
+                    printf("x=%d, got=0x%X, expected=0x%X\n", x, got, expected);
+                    okay = false;
+                }
+            }
+
+            DeleteSpirvRunner(runner);
+            puts(okay ? "\n\nhooray, got expected data" : "\n\ngot wrong values :(");
+        }
+        else {
+
         }
     }
 }

@@ -40,6 +40,7 @@ ret
 
 /* current dxbc_to_spirv:
 
+C:\VulkanSDK\1.2.148.1\Bin\spirv-dis.exe output.spv
 ; SPIR-V
 ; Version: 1.3
 ; Generator: Khronos; 0
@@ -76,10 +77,10 @@ ret
 %uint_4294967295 = OpConstant %uint 4294967295
 %_ptr_Input_v3uint = OpTypePointer Input %v3uint
 %ptr_vThreadID = OpVariable %_ptr_Input_v3uint Input
-         %23 = OpTypeImage %uint Buffer 0 0 0 2 Unknown
+         %23 = OpTypeImage %uint Buffer 0 0 0 2 R32ui
 %_ptr_UniformConstant_23 = OpTypePointer UniformConstant %23
    %ptr_uav0 = OpVariable %_ptr_UniformConstant_23 UniformConstant
-       %main = OpFunction %void None %4 ; <-------------------------------------------------------- start of interesting part
+       %main = OpFunction %void None %4
          %20 = OpLabel
 %vThreadID_xyz = OpLoad %v3uint %ptr_vThreadID
 %vThreadID_x = OpCompositeExtract %uint %vThreadID_xyz 0
@@ -91,12 +92,11 @@ ret
          %35 = OpLogicalOr %bool %33 %27
          %38 = OpSelect %uint %35 %uint_1000 %uint_2000
          %39 = OpIAdd %uint %38 %vThreadID_x
-         %41 = OpSelect %uint %34 %uint_4294967295 %uint_0 ; bool -> int
+         %41 = OpSelect %uint %34 %uint_4294967295 %uint_0 ; convert boolVal to intVal via: intVal = boolVal ? -1 : 0
          %42 = OpBitwiseXor %uint %41 %39
          %43 = OpLoad %23 %ptr_uav0
                OpImageWrite %43 %vThreadID_x %42
                OpReturn
                OpFunctionEnd
-
 */
 
