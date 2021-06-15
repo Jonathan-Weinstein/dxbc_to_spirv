@@ -22,7 +22,7 @@
 
 #define MAIN_U32 0x6E00696Du
 
-// does not suppoort removal
+// does not support removal
 // pointers are not stable
 class ConstantsMapScaler32 {
 public:
@@ -56,7 +56,21 @@ public:
     }
 };
 
+/*
+Note: The "Gen" or "G" in int means generic, and means
+OpTypeInt with a "signedness" of 0.
 
+It is undesired for sint and uint to be two distinct types,
+rather just have 32-bits and have the semantics be defined by each
+instruction. Spirv supposedly supports this. The spec says
+one way to think of signdess=0 is "no sign".
+
+I see some stuff some ops in the spec that say signedness must be 0,
+but I haven't seen anything saying must be 1. So I guess "G"-int
+can be used for everything, except maybe the sample-type of image decls,
+or when spirv 1.4's SignExtend and ZeroExtend image operands aren't available.
+
+*/
 enum {
     FixedSpvId_ExtInst_GLSL_std = 1,
 
@@ -108,7 +122,7 @@ struct Module {
     ConstantsMapScaler32 gint32Constants;
 
     //bound = idinfo.size();
-    // std::vector<SpirvIdInfo> idInfo; // will want this for value numbering to see if type ID's mismatch.
+    // std::vector<SpirvIdInfo> idInfo;
     SpvId _bound = FixedSpvId_End;
 
     SpvId ptr_vThreadID_id = 0;
@@ -319,7 +333,7 @@ static SpirvOpInfo GetSpirvOpInfo(DxbcInstrTag dxbcTag)
 
 
 struct DxbcComponentVarInfo {
-    unsigned spvValueId : 24, spvFixedTypeId : 8; // so many enums, I guess use this to denote the type for now.
+    unsigned spvValueId : 24, spvFixedTypeId : 8;
 };
 
 // Local Value Numbering
@@ -668,7 +682,7 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
     code.push_initlist({ SpvOpFunction | 5 << 16, FixedSpvId_TypeVoid, FixedSpvId_EntryFunction, SpvFunctionControlMaskNone, FixedSpvId_TypeVoidFunction });
     
     //this is the function's entry basic block:
-    code.push_initlist({SpvOpLabel | 2<<16, basicblock.spvId}); // do this with the inputs/descriptors stuff?
+    code.push_initlist({SpvOpLabel | 2<<16, basicblock.spvId});
     if (fn.vThreadID_xyx_id) {
         code.push4(SpvOpLoad | 4 << 16, FixedSpvId_TypeV3GenInt32, fn.vThreadID_xyx_id, m.ptr_vThreadID_id);
         for (uint comp = 0; comp < 3; ++comp) {
@@ -727,7 +741,6 @@ iadd r0.x, r0.x, vThreadID.x
 xor r0.x, r0.z, r0.x
 store_uav_typed u0.xyzw, vThreadID.xxxx, r0.xxxx
 ret
-// Approximately 9 instruction slots used
 )";
 
     DxbcTextToSpirvFile(DxbcText, "output.spv");
