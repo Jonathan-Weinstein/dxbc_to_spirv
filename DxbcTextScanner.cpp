@@ -56,18 +56,23 @@ static const DxbcInstrStringInfo StringTable[] = {
     { "dcl_thread_group",       DxbcInstrTag::dcl_thread_group,      DxbcInstrClass::misc_outside_function_body },
     // ...
     { "ret",                    DxbcInstrTag::ret,                   DxbcInstrClass::misc_in_function_body },
+    { "ld_uav_typed",           DxbcInstrTag::ld_uav_typed,          DxbcInstrClass::misc_in_function_body },
+    { "ld_uav_typed_indexable", DxbcInstrTag::ld_uav_typed,          DxbcInstrClass::misc_in_function_body },
     // ...
     { "not",/*no 'i' in str*/   DxbcInstrTag::inot,                  DxbcInstrClass::dst0_assign_unary_op },
     // ...
     { "and", /*no 'i' in str*/  DxbcInstrTag::iand,                  DxbcInstrClass::dst0_assign_binary_op },
     { "xor", /*no 'i' in str*/  DxbcInstrTag::ixor,                  DxbcInstrClass::dst0_assign_binary_op },
     { "or", /*no 'i' in str*/   DxbcInstrTag::ior,                   DxbcInstrClass::dst0_assign_binary_op },
+    { "ishl",                   DxbcInstrTag::ishl,                  DxbcInstrClass::dst0_assign_binary_op },
     { "iadd",                   DxbcInstrTag::iadd,                  DxbcInstrClass::dst0_assign_binary_op },
+    { "add",                    DxbcInstrTag::add,                   DxbcInstrClass::dst0_assign_binary_op },
     { "store_uav_typed",        DxbcInstrTag::store_uav_typed,       DxbcInstrClass::dst0_assign_binary_op },
     { "ult",                    DxbcInstrTag::ult,                   DxbcInstrClass::dst0_assign_binary_op },
     { "ieq",                    DxbcInstrTag::ieq,                   DxbcInstrClass::dst0_assign_binary_op },
     // ...
-    { "movc",                   DxbcInstrTag::movc,                  DxbcInstrClass::dst0_assign_tri_op }
+    { "movc",                   DxbcInstrTag::movc,                  DxbcInstrClass::dst0_assign_tri_op },
+    { "imad",                   DxbcInstrTag::imad,                  DxbcInstrClass::dst0_assign_tri_op },
 };
 
 static const DxbcInstrStringInfo *
@@ -91,6 +96,12 @@ SkipWs(const char *p)
             break;
     }
     return p;
+}
+
+static void
+SkipWs(DxbcTextScanner *scanner)
+{
+    scanner->pSrc = SkipWs(scanner->pSrc);
 }
 
 static bool IsAlphaOrUnderscore(uint c)
@@ -217,12 +228,17 @@ DxbcText_ScanHeader(DxbcTextScanner *scanner, DxbcHeaderInfo *headerInfo)
             } break;
             case DxbcInstrTag::dcl_input: { // dcl_input vThreadID.x
                 ByteView name; ScanCName(scanner, &name);
-                uint mask = ScanDotWriteOrInputMask(scanner);
-                if (EqualStrZ(name, "vThreadID")) {
-                    headerInfo->vThreadID_usedMask |= mask;
+                if (EqualStrZ(name, "vThreadIDInGroupFlattened")) {
+                    headerInfo->vThreadIDInGroupFlattened = true;
                 }
                 else {
-                    VERIFY(0);
+                    uint mask = ScanDotWriteOrInputMask(scanner);
+                    if (EqualStrZ(name, "vThreadID")) {
+                        headerInfo->vThreadID_usedMask |= mask;
+                    }
+                    else {
+                        VERIFY(0);
+                    }
                 }
             } break;
             case DxbcInstrTag::dcl_thread_group: { // dcl_thread_group 64, 1, 1
@@ -270,8 +286,21 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
         return DxbcTextScanResult::Okay;
     }
 
-    const int numDests = 1;
-    const int numSrcs = (int)info->instrClass - (int)DxbcInstrClass::dst0_assign_unary_op + 1;
+    int numDests = 1;
+    int numSrcs = (int)info->instrClass - (int)DxbcInstrClass::dst0_assign_unary_op + 1;
+
+    if (info->instrTag == DxbcInstrTag::ld_uav_typed) {
+        numSrcs = 2;
+        // ld_uav_typed_indexable(buffer)(uint,uint,uint,uint) r1.xyzw, vThreadID.xxxx, u0.xyzw
+        if (EqualStrZ(firstStr, "ld_uav_typed_indexable")) {
+            // TODO:
+            const char *p = scanner->pSrc;
+            while (*p != '\0' && *p != ')') { ++p; } if (*p == ')') { ++p; }
+            while (*p != '\0' && *p != ')') { ++p; } if (*p == ')') { ++p; }
+            scanner->pSrc = p;
+        }
+    }
+
     const int numTotalOperands = numDests + numSrcs;
 
     int srcSwizzleCharLen = -1;
@@ -282,6 +311,17 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
         // debug:
         for (uint c = 0; c < 4; ++c) {
             instr->operands[argIndex].immediateValue.u[c] = 0xdead0000u | c;
+        }
+
+        uint operandFlags = 0;
+        SkipWs(scanner);
+        if (scanner->pSrc[0] == '-') {
+            scanner->pSrc++;
+            operandFlags |= DxbcOperandFlag_SrcNeg;
+        }
+        if (scanner->pSrc[0] == '|') {
+            scanner->pSrc++;
+            operandFlags |= DxbcOperandFlag_SrcAbs;
         }
 
         ByteView argstr;
@@ -344,6 +384,11 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
                 file = DxbcFile::vThreadID;
                 slot = 0;
             }
+            else if (EqualStrZ(argstr, "ThreadIDInGroupFlattened")) {
+                Verify(argIndex >= numDests, "v* can't be dst");
+                file = DxbcFile::vThreadIDInGroupFlattened;
+                slot = 0;
+            }
             else {
                 Verify(0, "TODO: implement v* input besides vThreadID");
             }
@@ -401,9 +446,10 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
                 Verify(!(writeMask & 1u << comp), "bad writemask");
                 writeMask |= 1u << comp;
             }
-            instr->operands[argIndex].comps.dstWritemask = writeMask;
+            instr->operands[argIndex].dstWritemask = writeMask;
             writeMaskCharLen = maskStr.Length();
             writeMaskBits = writeMask;
+            VERIFY((operandFlags & ~DxbcOperandFlag_DstSat) == 0);
         }
         else {
             // parse src swizzle and abs/neg
@@ -446,8 +492,18 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
                     swizzle |= comp << (i++ * 2);
                 }
             }
-            instr->operands[argIndex].comps.srcSwizzle.bits = swizzle;
+            instr->operands[argIndex].srcSwizzle.bits = swizzle;
+            if (operandFlags & DxbcOperandFlag_SrcAbs) {
+                // closing absolute-value bar: "add r0.y, -|r0.z|, r0.y"
+                if (scanner->pSrc[0] == '|') {
+                    scanner->pSrc++;
+                }
+                else {
+                    VERIFY(0);
+                }
+            }
         }
+        instr->operands[argIndex].flags = operandFlags;
 
         if (++argIndex == numTotalOperands) {
             break;

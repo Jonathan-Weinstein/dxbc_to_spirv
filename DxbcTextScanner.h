@@ -9,6 +9,7 @@ enum {
 struct DxbcHeaderInfo {
     uint8_t globalFlags; // dcl_globalFlags refactoringAllowed
     uint8_t vThreadID_usedMask;
+    bool vThreadIDInGroupFlattened;
     uint16_t numTemps; // up to 4096 32bitx4 temps, r0 through rN-1
     struct { int x, y, z; } workgroupSize;
 
@@ -30,10 +31,11 @@ struct DxbcSourceSwizzle {
 };
 
 enum class DxbcFile : uint8_t {
+    immediate,
     temp,
     uav,
     vThreadID,
-    immediate,
+    vThreadIDInGroupFlattened,
 };
 
 enum class DxbcInstrClass : uint8_t {
@@ -58,16 +60,25 @@ enum class DxbcInstrTag : uint8_t {
     iand,
     ixor,
     inot,
+    ishl,
     iadd,
+    imad,
+    add, // flt
     store_uav_typed,
+    ld_uav_typed,
+};
+
+enum {
+    DxbcOperandFlag_SrcAbs = 1 << 0,
+    DxbcOperandFlag_SrcNeg = 1 << 1,
+    DxbcOperandFlag_DstSat = 1 << 2
 };
 
 struct DxbcOperand {
     DxbcFile file;
-    union {
-        uint8_t dstWritemask;
-        DxbcSourceSwizzle srcSwizzle;
-    } comps;
+    uint8_t flags;
+    uint8_t dstWritemask;
+    DxbcSourceSwizzle srcSwizzle;
     int16_t slotInFile;
     union {
         uint32_t u[4];

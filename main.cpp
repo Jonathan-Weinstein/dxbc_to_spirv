@@ -119,6 +119,8 @@ struct Function {
     SpvId vThreadID_xyx_id = 0;
     SpvId vThreadID_c_id[3] = {}; // OpCompositeExtract of the above.
     // SpvId uav_ids[64] = {};
+
+    SpvId vThreadIDInGroupFlattened_id = 0;
 };
 
 
@@ -135,6 +137,8 @@ struct Module {
     SpvId ptr_uav_ids[64] = { };
     SpvId uav_image_type_ids[64] = { };
 
+    SpvId ptr_vThreadIDInGroupFlattened_id = 0;
+
     SpvId GetBound() const { return _bound; }
 
 
@@ -150,6 +154,16 @@ struct Module {
             }
             id = this->_bound++;
             fn->vThreadID_c_id[comp] = id;
+        }
+        return id;
+    }
+
+    SpvId Get_vThreadIDInGroupFlattened_id(Function *fn)
+    {
+        SpvId id = fn->vThreadIDInGroupFlattened_id;
+        if (!id) {
+            id = this->AllocId();
+            fn->vThreadIDInGroupFlattened_id = id;
         }
         return id;
     }
@@ -315,6 +329,18 @@ struct SpirvOpInfo {
             return 0;
         }
     }
+
+    bool IsBitShift() const
+    {
+
+        switch (similarSpvOp) {
+        case SpvOpShiftLeftLogical:
+        case SpvOpShiftRightLogical:
+        case SpvOpShiftRightArithmetic:
+            return true;
+        }
+        return false;
+    }
 };
 
 static SpirvOpInfo GetSpirvOpInfo(DxbcInstrTag dxbcTag)
@@ -325,9 +351,11 @@ static SpirvOpInfo GetSpirvOpInfo(DxbcInstrTag dxbcTag)
     case DxbcInstrTag::ixor: return { SpvOpBitwiseXor, SpirvOpClass::int_common };
     case DxbcInstrTag::inot: return { SpvOpNot, SpirvOpClass::int_common };
     case DxbcInstrTag::iadd: return { SpvOpIAdd, SpirvOpClass::int_common };
+    case DxbcInstrTag::add: return { SpvOpFAdd, SpirvOpClass::float_common };
     case DxbcInstrTag::movc: return { SpvOpSelect, SpirvOpClass::select_generic };
     case DxbcInstrTag::ult: return { SpvOpULessThan, SpirvOpClass::int_cmp };
     case DxbcInstrTag::ieq: return { SpvOpIEqual, SpirvOpClass::int_cmp };
+    case DxbcInstrTag::ishl: return { SpvOpShiftLeftLogical, SpirvOpClass::int_common };
     default:
         return {};
     }
@@ -356,7 +384,7 @@ struct LvnContext {
     SpvId TypeIdOfCurrentValue(uint writeMaskComp, const DxbcOperand& src) const
     {
         ASSERT(src.file == DxbcFile::temp);
-        uint comp = src.comps.srcSwizzle[writeMaskComp];
+        uint comp = src.srcSwizzle[writeMaskComp];
         return dxbcVarInfo[src.slotInFile][comp].spvFixedTypeId;
     }
 };
@@ -367,7 +395,7 @@ GetSrcValueWithType(Module& m, Function& function, BasicBlock& bb, LvnContext& l
 {
     ASSERT(desiredTypeId < (uint)FixedSpvId_End);
 
-    const uint srcComponentIndex = src.comps.srcSwizzle[writeMaskComp];
+    const uint srcComponentIndex = src.srcSwizzle[writeMaskComp];
 
     SpvId valueId;
     SpvId typeId;
@@ -380,6 +408,10 @@ GetSrcValueWithType(Module& m, Function& function, BasicBlock& bb, LvnContext& l
     }
     else if (src.file == DxbcFile::vThreadID) {
         valueId = m.Get_vThreadID_c_id(&function, srcComponentIndex);
+        typeId = FixedSpvId_TypeGenInt32;
+    }
+    else if (src.file == DxbcFile::vThreadIDInGroupFlattened) {
+        valueId = m.Get_vThreadIDInGroupFlattened_id(&function);
         typeId = FixedSpvId_TypeGenInt32;
     }
     else {
@@ -420,6 +452,21 @@ GetSrcValueWithType(Module& m, Function& function, BasicBlock& bb, LvnContext& l
         else {
             valueId = EmitBitcast(m, bb.code, desiredTypeId, valueId);
         }
+    }
+
+    if (src.flags & DxbcOperandFlag_SrcAbs) {
+        ASSERT(desiredTypeId == FixedSpvId_TypeFloat32);
+        SpvId const srcValId = valueId;
+        valueId = m.AllocId();
+        /* 6 words for { dst = unary src... } */
+        bb.code.push_initlist({ SpvOpExtInst | 6 << 16, desiredTypeId, valueId, FixedSpvId_ExtInst_GLSL_std, GLSLstd450FAbs, srcValId });
+    }
+    if (src.flags & DxbcOperandFlag_SrcNeg) {
+        ASSERT(desiredTypeId == FixedSpvId_TypeFloat32 || desiredTypeId == FixedSpvId_TypeGenInt32);
+        SpvOp const negOp = (desiredTypeId == FixedSpvId_TypeFloat32) ? SpvOpFNegate : SpvOpSNegate;
+        SpvId const srcValId = valueId;
+        valueId = m.AllocId();
+        bb.code.push4(negOp | 4 << 16u, desiredTypeId, valueId, srcValId);
     }
 
     return valueId;
@@ -469,12 +516,43 @@ SimpleCodegenBasicBlock(Module& m, Function& function, BasicBlock& bb, bool bEmi
                 0, dxbcInstr.operands[2], FixedSpvId_TypeGenInt32);
             bb.code.push4(SpvOpImageWrite | 4 << 16, imageId, coordId, texelValueId);
         }
+        else if (dxbcInstr.tag == DxbcInstrTag::ld_uav_typed) {
+            // very similar to "ld" (SRVs)
+            puts("TODO: ld_uav_typed");
+            const uint numDests = 1;
+            const uint numSrcs = 2; // coord, uav
+            const DxbcOperand *srcs = dxbcInstr.operands + numDests;
+            const DxbcOperand& dst = dxbcInstr.operands[0];
+            const uint writeMask = dst.dstWritemask;
+            ASSERT(writeMask);
+            for (uint writeCompIndex = 0; writeCompIndex < 4u; ++writeCompIndex) {
+                if (!(writeMask & 1u << writeCompIndex)) {
+                    continue;
+                }
+                lvn.dxbcVarInfo[uint(dst.slotInFile)][writeCompIndex] = { m.GetGIntConstantId(880 + writeCompIndex), FixedSpvId_TypeGenInt32 };
+            }
+        }
+        else if (dxbcInstr.tag == DxbcInstrTag::imad) {
+            puts("TODO: imad");
+            const uint numDests = 1;
+            const uint numSrcs = 3; // a*b+c
+            const DxbcOperand *srcs = dxbcInstr.operands + numDests;
+            const DxbcOperand& dst = dxbcInstr.operands[0];
+            const uint writeMask = dst.dstWritemask;
+            ASSERT(writeMask);
+            for (uint writeCompIndex = 0; writeCompIndex < 4u; ++writeCompIndex) {
+                if (!(writeMask & 1u << writeCompIndex)) {
+                    continue;
+                }
+                lvn.dxbcVarInfo[uint(dst.slotInFile)][writeCompIndex] = { m.GetGIntConstantId(770 + writeCompIndex), FixedSpvId_TypeGenInt32 };
+            }
+        }
         else if (dxbcInstr.tag == DxbcInstrTag::movc) {
             puts("todo: movc, try avoiding bitcasts for floats");
             const DxbcOperand *srcs = dxbcInstr.operands + 1;
             const DxbcOperand& dst = dxbcInstr.operands[0];
             for (uint writeCompIndex = 0; writeCompIndex < 4u; ++writeCompIndex) {
-                if (!(dst.comps.dstWritemask & 1u << writeCompIndex)) {
+                if (!(dst.dstWritemask & 1u << writeCompIndex)) {
                     continue;
                 }
                 const SpvId dstTypeSpvId = FixedSpvId_TypeGenInt32;
@@ -490,16 +568,18 @@ SimpleCodegenBasicBlock(Module& m, Function& function, BasicBlock& bb, bool bEmi
         } else {
             const uint numDests = dxbcInstr.NumDstRegs();
             const uint numSrcs = dxbcInstr.NumSrcRegs();
-            const DxbcOperand *srcs = dxbcInstr.operands + numDests;
             const DxbcOperand& dst = dxbcInstr.operands[0];
-            ASSERT(numDests == 1); // TODO: handle other stuff
+            ASSERT(numDests == 1);
             ASSERT(numSrcs == 2); // TODO: handle other stuff
-            const uint writeMask = dst.comps.dstWritemask;
+            const uint writeMask = dst.dstWritemask;
             ASSERT(writeMask);
             for (uint writeCompIndex = 0; writeCompIndex < 4u; ++writeCompIndex) {
                 if (!(writeMask & 1u << writeCompIndex)) {
                     continue;
                 }
+
+                const DxbcOperand *srcs = dxbcInstr.operands + numDests; // can mut for add ans shift stuff
+                DxbcOperand aTmpSrcs[3]; // for add/sub order and flags.
 
                 // ult, ieq can have diff dst type id
                 SpvId srcTypeSpvId = spvOpInfo.IsFloatArithmeticOrCompare() ? FixedSpvId_TypeFloat32 : FixedSpvId_TypeGenInt32;
@@ -508,21 +588,64 @@ SimpleCodegenBasicBlock(Module& m, Function& function, BasicBlock& bb, bool bEmi
                 SpvOp op = SpvOp(spvOpInfo.similarSpvOp);
                 SpvId srcValueIds[2];
 
-                /* Prefer leaving stuff in bools if the next op can be done using bools: */
-                const SpvOp boolSpvOp = spvOpInfo.BoolLogicOpOfBitwiseIntOp();
-                if (boolSpvOp && 
-                    srcs[0].file == DxbcFile::temp && 
-                    srcs[1].file == DxbcFile::temp &&
-                    lvn.TypeIdOfCurrentValue(writeCompIndex, srcs[0]) == FixedSpvId_TypeBool && 
-                    lvn.TypeIdOfCurrentValue(writeCompIndex, srcs[1]) == FixedSpvId_TypeBool) { 
-                    dstTypeSpvId = FixedSpvId_TypeBool;
-                    srcTypeSpvId = FixedSpvId_TypeBool;
-                    op = boolSpvOp;
+                /* pre src fetch special handling, some of this is the same for each comp and could be moved up */
+                if (op == SpvOpIAdd || op == SpvOpFAdd) {
+                    aTmpSrcs[0] = srcs[0];
+                    aTmpSrcs[1] = srcs[1];
+                    SpvOp const subOp = (op == SpvOpIAdd) ? SpvOpISub : SpvOpFSub;
+                    if (aTmpSrcs[0].flags & DxbcOperandFlag_SrcNeg) {
+                        op = subOp;
+                        if (aTmpSrcs[1].flags & DxbcOperandFlag_SrcNeg) {
+                            // dst = -a + -b :: -a - b
+                            aTmpSrcs[1].flags &= ~DxbcOperandFlag_SrcNeg;
+                        }
+                        else {
+                            // dst = -a + b :: b - a
+                            aTmpSrcs[0].flags &= ~DxbcOperandFlag_SrcNeg;
+                            DxbcOperand const tmp0 = aTmpSrcs[0]; // swap em
+                            aTmpSrcs[0] = aTmpSrcs[1];
+                            aTmpSrcs[1] = tmp0;
+                        }
+                        srcs = aTmpSrcs;
+                    }
+                    else if (aTmpSrcs[1].flags & DxbcOperandFlag_SrcNeg) {
+                        // dst =  a + -b :: a - b
+                        op = subOp;
+                        aTmpSrcs[1].flags &= ~DxbcOperandFlag_SrcNeg;
+                        srcs = aTmpSrcs;
+                    }
+                }
+                else if (spvOpInfo.IsBitShift()) {
+                    if (srcs[1].file == DxbcFile::immediate) {
+                        aTmpSrcs[0] = srcs[0];
+                        aTmpSrcs[1] = srcs[1];
+                        aTmpSrcs[1].immediateValue.u[aTmpSrcs[1].srcSwizzle[writeCompIndex]] &= 31u;
+                        srcs = aTmpSrcs;
+                    }
+                }
+                else if (const SpvOp boolSpvOp = spvOpInfo.BoolLogicOpOfBitwiseIntOp()) { 
+                    /* Prefer leaving stuff in bools if the next op can be done using bools: */
+                    if (srcs[0].file == DxbcFile::temp &&
+                        srcs[1].file == DxbcFile::temp &&
+                        lvn.TypeIdOfCurrentValue(writeCompIndex, srcs[0]) == FixedSpvId_TypeBool &&
+                        lvn.TypeIdOfCurrentValue(writeCompIndex, srcs[1]) == FixedSpvId_TypeBool) {
+                        
+                        dstTypeSpvId = FixedSpvId_TypeBool;
+                        srcTypeSpvId = FixedSpvId_TypeBool;
+                        op = boolSpvOp;
+                    }
                 }
 
+                /* fetch srcs: */
                 for (uint srcIndex = 0; srcIndex < numSrcs; ++srcIndex) {
                     srcValueIds[srcIndex] = GetSrcValueWithType(m, function, bb, lvn, writeCompIndex,
                                                                 srcs[srcIndex], srcTypeSpvId);
+                }
+
+                /* post src fetch special handling: */
+                if (spvOpInfo.IsBitShift() && srcs[1].file != DxbcFile::immediate) {
+                    /* undefined in spirv if shift exceeds bitwidth of type, dxbc says low 5 bits are used (for uint32_t). */
+                    ASSERT(0);
                 }
 
                 SpvId dstValueId = EmitBinOp(m, bb.code, op, dstTypeSpvId,
@@ -535,7 +658,7 @@ SimpleCodegenBasicBlock(Module& m, Function& function, BasicBlock& bb, bool bEmi
     }
 }
 
-void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
+void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename, SpvImageFormat uav0Format = SpvImageFormatUnknown) // okay if write-only
 {
     DxbcTextScanner scanner = { szDxbcText };
     
@@ -552,6 +675,9 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
     
     if (m.dxbcHeaderInfo.vThreadID_usedMask) {
         m.ptr_vThreadID_id = m.AllocId();
+    }
+    if (m.dxbcHeaderInfo.vThreadIDInGroupFlattened) {
+        m.ptr_vThreadIDInGroupFlattened_id = m.AllocId();
     }
     if (m.dxbcHeaderInfo.uavDeclMask) {
         m.ptr_uav_ids[0] = m.AllocId();
@@ -583,6 +709,7 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
         SpvCapabilityShader,
         SpvCapabilitySampledBuffer,
         SpvCapabilityImageBuffer,
+        SpvCapabilityStorageImageWriteWithoutFormat
     };
     p = code.uninitialized_push_n(lengthof(spvCaps) * 2);
     for (SpvCapability cap : spvCaps) {
@@ -608,6 +735,10 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
             code[index] += 1u << 16;
             code.push(m.ptr_vThreadID_id);
         }
+        if (m.ptr_vThreadIDInGroupFlattened_id) {
+            code[index] += 1u << 16;
+            code.push(m.ptr_vThreadIDInGroupFlattened_id);
+        }
     }
     // Section 6: execution modes: --------------------------------------------------------------------------
     const uint32_t workGroupSizeStuff[] = {
@@ -622,7 +753,7 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
     if (m.ptr_vThreadID_id) {
         EmitOpName(code, m.ptr_vThreadID_id, "ptr_vThreadID");
         if (fn.vThreadID_xyx_id) {
-            EmitOpName(code, fn.vThreadID_xyx_id, "vThreadID_xyz");
+            EmitOpName(code, fn.vThreadID_xyx_id, "vThreadID");
             char strbuf[] = "vThreadID_";
             for (int comp = 0; comp < 3; ++comp) {
                 const SpvId id = fn.vThreadID_c_id[comp];
@@ -631,6 +762,12 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
                     EmitOpName(code, id, strbuf);
                 }
             }
+        }
+    }
+    if (m.ptr_vThreadIDInGroupFlattened_id) {
+        EmitOpName(code, m.ptr_vThreadIDInGroupFlattened_id, "ptr_vThreadIDInGroupFlattened");
+        if (fn.vThreadIDInGroupFlattened_id) {
+            EmitOpName(code, fn.vThreadIDInGroupFlattened_id, "vThreadIDInGroupFlattened");
         }
     }
 
@@ -642,6 +779,10 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
     // Section 8: annotations/decorations --------------------------------------------------------------------------
     if (m.ptr_vThreadID_id) {
         EmitDecorateBuiltin(code, m.ptr_vThreadID_id, SpvBuiltInGlobalInvocationId);
+    }
+    if (m.ptr_vThreadIDInGroupFlattened_id) {
+        // multiple arrays, for less branches?
+        EmitDecorateBuiltin(code, m.ptr_vThreadIDInGroupFlattened_id, SpvBuiltInLocalInvocationIndex);
     }
     if (m.ptr_uav_ids[0]) {
         EmitDecorateSetAndBinding(code, m.ptr_uav_ids[0], 0, 0);
@@ -656,6 +797,11 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
     code.push_initlist({ SpvOpTypeVector | 4 << 16, FixedSpvId_TypeV3GenInt32, FixedSpvId_TypeGenInt32, 3 });
     code.push_initlist({ SpvOpTypeVector | 4 << 16, FixedSpvId_TypeV4GenInt32, FixedSpvId_TypeGenInt32, 4 });
     
+    code.push_initlist({ SpvOpTypeFloat | 3 << 16, FixedSpvId_TypeFloat32, 32 });
+    //code.push_initlist({ SpvOpTypeVector | 4 << 16, FixedSpvId_TypeV2Float32, FixedSpvId_TypeFloat32, 2 });
+    //code.push_initlist({ SpvOpTypeVector | 4 << 16, FixedSpvId_TypeV3Float32, FixedSpvId_TypeFloat32, 3 });
+    code.push_initlist({ SpvOpTypeVector | 4 << 16, FixedSpvId_TypeV4Float32, FixedSpvId_TypeFloat32, 4 });
+
     code.push_initlist({ SpvOpTypeBool | 2 << 16, FixedSpvId_TypeBool });
 
     EmitScalarConstants(code, m.gint32Constants, FixedSpvId_TypeGenInt32);
@@ -666,6 +812,12 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
         code.push_initlist({ SpvOpTypePointer | 4 << 16, ptr_input_v3gint_type_id, uint32_t(storageClass), FixedSpvId_TypeV3GenInt32 });
         code.push_initlist({ SpvOpVariable | 4 << 16, ptr_input_v3gint_type_id, m.ptr_vThreadID_id, uint32_t(storageClass) });
     }
+    if (m.ptr_vThreadIDInGroupFlattened_id) {
+        const SpvStorageClass storageClass = SpvStorageClassInput;
+        const SpvId ptr_input_gint_type_id = m.AllocId(); // misc hash table
+        code.push_initlist({ SpvOpTypePointer | 4 << 16, ptr_input_gint_type_id, uint32_t(storageClass), FixedSpvId_TypeGenInt32 });
+        code.push_initlist({ SpvOpVariable | 4 << 16, ptr_input_gint_type_id, m.ptr_vThreadIDInGroupFlattened_id, uint32_t(storageClass) });
+    }
     if (m.ptr_uav_ids[0]) {
         const SpvStorageClass storageClass = SpvStorageClassUniformConstant;
         SpvId const uavImageTypeId = m.uav_image_type_ids[0];
@@ -673,7 +825,7 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
         code.push_initlist({
             SpvOpTypeImage | 9 << 16, m.uav_image_type_ids[0], FixedSpvId_TypeGenInt32,
             SpvDimBuffer, 0, 0, // dim, "depth", arrayed
-            0, 2, SpvImageFormatR32ui, // MS, "sampled", actual VkImageViewFormat
+            0, 2, uint32_t(uav0Format), // MS, "sampled", SpvImageFormat*
         });
         const SpvId ptr_type_id = m.AllocId();
         code.push_initlist({ SpvOpTypePointer | 4 << 16, ptr_type_id, uint32_t(storageClass), uavImageTypeId });
@@ -697,6 +849,9 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
             }
         }
     }
+    if (fn.vThreadIDInGroupFlattened_id) {
+        code.push4(SpvOpLoad | 4 << 16, FixedSpvId_TypeGenInt32, fn.vThreadIDInGroupFlattened_id, m.ptr_vThreadIDInGroupFlattened_id);
+    }
     code.push_n(basicblock.code.data(), basicblock.code.size()); // should push a return too
     code.push(SpvOpFunctionEnd | 1 << 16);
 
@@ -717,6 +872,7 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
         }
     }
 
+#if 0
     {
         auto const GetValue = [](uint x) -> uint {
 	        // All these bools can stay as bools in spirv...
@@ -751,6 +907,7 @@ void DxbcTextToSpirvFile(const char *szDxbcText, const char *filename)
 
         }
     }
+#endif
 }
 
 
@@ -767,7 +924,8 @@ C:\VulkanSDK\1.2.148.1\Bin\dxc.exe -spirv some_file.hlsl -T cs_5_0 -E main -O3
 **/
 int main(void)
 {
-    static const char DxbcText[] = R"(cs_5_0
+#if 1
+    static const char LogicalOrDxbcText[] = R"(cs_5_0
 dcl_globalFlags refactoringAllowed
 dcl_uav_typed_buffer (uint,uint,uint,uint) u0
 dcl_input vThreadID.x
@@ -784,7 +942,43 @@ store_uav_typed u0.xyzw, vThreadID.xxxx, r0.xxxx
 ret
 )";
 
-    DxbcTextToSpirvFile(DxbcText, "output.spv");
+    DxbcTextToSpirvFile(LogicalOrDxbcText, "output.spv");
+#endif
 
+#if 1
+    static const char AddFiestaDxbcText[] = R"(cs_5_0
+dcl_globalFlags refactoringAllowed
+dcl_uav_typed_buffer (uint,uint,uint,uint) u0
+dcl_input vThreadIDInGroupFlattened
+dcl_input vThreadID.x
+dcl_temps 2
+dcl_thread_group 4, 4, 4
+ld_uav_typed_indexable(buffer)(uint,uint,uint,uint) r0.xyzw, vThreadIDInGroupFlattened.xxxx, u0.xyzw
+iadd r1.x, -r0.w, -vThreadIDInGroupFlattened.x
+iadd r1.w, r1.x, -vThreadID.x
+iadd r1.x, r0.y, r0.x
+iadd r1.yz, -r0.zzzz, r0.yywy
+store_uav_typed u0.xyzw, vThreadIDInGroupFlattened.xxxx, r1.xyzw
+ret
+)";
+
+    DxbcTextToSpirvFile(AddFiestaDxbcText, "AddInts.spv", SpvImageFormatRgba32ui);
+#endif
+
+#if 1
+    static const char FltDxbcText[] = R"(cs_5_0
+dcl_globalFlags refactoringAllowed
+dcl_uav_typed_buffer (uint,uint,uint,uint) u0
+dcl_input vThreadIDInGroupFlattened
+dcl_input vThreadID.x
+dcl_temps 2
+dcl_thread_group 4, 4, 4
+ld_uav_typed_indexable(buffer)(uint,uint,uint,uint) r0.xyzw, vThreadIDInGroupFlattened.xxxx, u0.xyzw
+add r0.y, -|r0.z|, r0.y
+ret
+)";
+
+    DxbcTextToSpirvFile(FltDxbcText, "Flt.spv");
+#endif
     return 0;
 }

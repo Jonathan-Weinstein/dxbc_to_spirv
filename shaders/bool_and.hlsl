@@ -49,13 +49,14 @@ C:\VulkanSDK\1.2.148.1\Bin\spirv-dis.exe output.spv
                OpCapability Shader
                OpCapability SampledBuffer
                OpCapability ImageBuffer
+               OpCapability StorageImageWriteWithoutFormat
           %1 = OpExtInstImport "GLSL.std.450"
                OpMemoryModel Logical GLSL450
                OpEntryPoint GLCompute %main "main" %ptr_vThreadID
                OpExecutionMode %main LocalSize 64 1 1
                OpName %main "main"
                OpName %ptr_vThreadID "ptr_vThreadID"
-               OpName %vThreadID_xyz "vThreadID_xyz"
+               OpName %vThreadID "vThreadID"
                OpName %vThreadID_x "vThreadID_x"
                OpName %ptr_uav0 "ptr_uav0"
                OpDecorate %ptr_vThreadID BuiltIn GlobalInvocationId
@@ -77,13 +78,13 @@ C:\VulkanSDK\1.2.148.1\Bin\spirv-dis.exe output.spv
 %uint_4294967295 = OpConstant %uint 4294967295
 %_ptr_Input_v3uint = OpTypePointer Input %v3uint
 %ptr_vThreadID = OpVariable %_ptr_Input_v3uint Input
-         %23 = OpTypeImage %uint Buffer 0 0 0 2 R32ui
+         %23 = OpTypeImage %uint Buffer 0 0 0 2 Unknown
 %_ptr_UniformConstant_23 = OpTypePointer UniformConstant %23
    %ptr_uav0 = OpVariable %_ptr_UniformConstant_23 UniformConstant
        %main = OpFunction %void None %4
          %20 = OpLabel
-%vThreadID_xyz = OpLoad %v3uint %ptr_vThreadID
-%vThreadID_x = OpCompositeExtract %uint %vThreadID_xyz 0
+  %vThreadID = OpLoad %v3uint %ptr_vThreadID
+%vThreadID_x = OpCompositeExtract %uint %vThreadID 0
          %27 = OpULessThan %bool %vThreadID_x %uint_32
          %29 = OpBitwiseAnd %uint %vThreadID_x %uint_4
          %31 = OpBitwiseAnd %uint %vThreadID_x %uint_2
@@ -92,7 +93,7 @@ C:\VulkanSDK\1.2.148.1\Bin\spirv-dis.exe output.spv
          %35 = OpLogicalOr %bool %33 %27
          %38 = OpSelect %uint %35 %uint_1000 %uint_2000
          %39 = OpIAdd %uint %38 %vThreadID_x
-         %41 = OpSelect %uint %34 %uint_4294967295 %uint_0 ; convert boolVal to intVal via: intVal = boolVal ? -1 : 0
+         %41 = OpSelect %uint %34 %uint_4294967295 %uint_0
          %42 = OpBitwiseXor %uint %41 %39
          %43 = OpLoad %23 %ptr_uav0
                OpImageWrite %43 %vThreadID_x %42
