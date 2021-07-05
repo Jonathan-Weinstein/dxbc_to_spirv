@@ -77,3 +77,11 @@ template<class T> constexpr T Max(T a, T b) { return a < b ? b : a; }
 
 template<class T, uint N> constexpr uint lengthof(T(&)[N]) { return N; }
 
+template<class T>
+void Swap(T &a, T &b)
+{
+    T const tmpA = a;
+    a = b;
+    b = tmpA;
+}
+

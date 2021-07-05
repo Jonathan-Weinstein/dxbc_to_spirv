@@ -547,20 +547,68 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
             }
         }
         else if (dxbcInstr.tag == DxbcInstrTag::imad) {
-            // can also remove an int negation here by using SpvOpISub when applicable
-            puts("TODO: imad");
-            const uint numDests = 1;
-            const uint numSrcs = 3; // a*b+c
-            const DxbcOperand *srcs = dxbcInstr.operands + numDests;
             const DxbcOperand& dst = dxbcInstr.operands[0];
-            const uint writeMask = dst.dstWritemask;
-            ASSERT(writeMask);
-            for (uint writeCompIndex = 0; writeCompIndex < 4u; ++writeCompIndex) {
-                if (!(writeMask & 1u << writeCompIndex)) {
-                    continue;
-                }
-                lvn.dxbcVarInfo[uint(dst.slotInFile)][writeCompIndex] = { m.GetGIntConstantId(770 + writeCompIndex), StaticSpvId_TypeGenInt32 };
+            // May modify these, make a copy:
+            DxbcOperand srcs[3]; for (int i = 0; i < 3; ++i) {
+                srcs[i] = dxbcInstr.operands[i + 1];
             }
+            // -a*-b == a*b
+            if (srcs[0].flags & srcs[1].flags & DxbcOperandFlag_SrcNeg) {
+                srcs[0].flags &= ~DxbcOperandFlag_SrcNeg;
+                srcs[1].flags &= ~DxbcOperandFlag_SrcNeg;
+            }
+            ASSERT(srcs[0].file != DxbcFile::immediate); // TODO: swap src[0], src[1] ?
+            uint shiftMask = 0;
+            if (srcs[1].file == DxbcFile::immediate) {
+                if (srcs[1].flags & DxbcOperandFlag_SrcNeg) {
+                    srcs[1].flags &= ~DxbcOperandFlag_SrcNeg;
+                    for (uint32_t& r : srcs[1].immediateValue.u) {
+                        r = -int32_t(r);
+                    }
+                }
+                for (int i = 0; i < 4; ++i) {
+                    uint32_t& r = srcs[1].immediateValue.u[i];
+                    if (r && (r & (r - 1)) == 0) {
+                        r = bsf(r);
+                        shiftMask |= 1u << i;
+                    }
+                }
+            }
+            enum class Plan { MulAdd, MulSub, MulReverseSub } plan = Plan::MulAdd;
+            if (srcs[2].flags & DxbcOperandFlag_SrcNeg) {
+                plan = Plan::MulSub;
+                srcs[2].flags &= ~DxbcOperandFlag_SrcNeg;
+            }
+            else if ((srcs[0].flags | srcs[1].flags) & DxbcOperandFlag_SrcNeg) {
+                ASSERT((srcs[0].flags ^ srcs[1].flags) & DxbcOperandFlag_SrcNeg);
+                plan = Plan::MulReverseSub;
+                // or do the normalize thing before.
+                srcs[0].flags &= ~DxbcOperandFlag_SrcNeg;
+                srcs[1].flags &= ~DxbcOperandFlag_SrcNeg;
+            }
+            uint wm = dst.dstWritemask;
+            ASSERT(wm);
+            do {
+                uint const writeCompIndex = bsf(wm);
+                SpvOp mulOp = SpvOpIMul;
+                uint fullSrcComp = srcs[1].srcSwizzle[writeCompIndex];
+                if (shiftMask & (1u << fullSrcComp)) {
+                    mulOp = SpvOpShiftLeftLogical;
+                }
+                SpvId srcValIds[3]; for (int i = 0; i < 3; ++i) {
+                    srcValIds[i] = GetSrcValueWithType(m, function, code, lvn, writeCompIndex, srcs[i], StaticSpvId_TypeGenInt32);
+                }
+                SpvId productId = EmitBinOp(m, code, mulOp, StaticSpvId_TypeGenInt32, srcValIds[0], srcValIds[1]);
+                SpvOp addOp = SpvOpIAdd;
+                if (plan != Plan::MulAdd) {
+                    addOp = SpvOpISub;
+                    if (plan == Plan::MulReverseSub) {
+                        Swap(productId, srcValIds[2]);
+                    }
+                }
+                SpvId finalVal = EmitBinOp(m, code, addOp, StaticSpvId_TypeGenInt32, productId, srcValIds[2]);
+                lvn.dxbcVarInfo[uint(dst.slotInFile)][writeCompIndex] = { finalVal, StaticSpvId_TypeGenInt32 };
+            } while ((wm &= wm - 1) != 0);
         }
         else if (dxbcInstr.tag == DxbcInstrTag::movc) {
             const DxbcOperand *srcs = dxbcInstr.operands + 1;
@@ -980,7 +1028,7 @@ ret
 #endif
 
 #if 1
-    static const char FltDxbcText[] = R"(cs_5_0
+    static const char MiscDxbcText[] = R"(cs_5_0
 dcl_globalFlags refactoringAllowed
 dcl_uav_typed_buffer (uint,uint,uint,uint) u0
 dcl_input vThreadIDInGroupFlattened
@@ -989,10 +1037,15 @@ dcl_temps 2
 dcl_thread_group 4, 4, 4
 ld_uav_typed_indexable(buffer)(uint,uint,uint,uint) r0.xyzw, vThreadIDInGroupFlattened.xxxx, u0.xyzw
 add r0.y, -|r0.z|, r0.y
+imad r0.x, r0.x, l(4), l(1)
+xor r0.x, r0.x, l(100)
+imad r0.x, r0.x, -r0.x, l(1)
+xor r0.x, r0.x, l(200)
+imad r0.x, r0.x, r0.x, -r0.w
 ret
 )";
 
-    DxbcTextToSpirvFile(FltDxbcText, "Flt.spv");
+    DxbcTextToSpirvFile(MiscDxbcText, "Flt.spv");
 #endif
     return 0;
 }
