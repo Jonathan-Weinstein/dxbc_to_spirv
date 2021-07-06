@@ -1,8 +1,4 @@
 /*
-
-    GetSrcValueWithType() and SimpleCodegenBasicBlock() are the interesting functions.
-
-
     Can be built with something like:
     windows:
         g++ -std=c++11 -I %VULKAN_SDK%\Include -I %VULKAN_SDK%\Include\spirv-headers *.cpp
@@ -391,6 +387,21 @@ struct LvnContext {
     }
 };
 
+static void WriteVariable(LvnContext &lvn, uint comp, const DxbcOperand& dst, SpvId valueId, SpvId typeId)
+{
+    ASSERT(uint(typeId) < StaticSpvId_End);
+    if (dst.file == DxbcFile::temp) {
+        ASSERT(comp < 4u);
+        uint const slot = uint(dst.slotInFile);
+        ASSERT(slot < lengthof(lvn.dxbcVarInfo));
+        // and mark "dirty" by chaning from nonzero
+        lvn.dxbcVarInfo[slot][comp] = { valueId, typeId };
+    }
+    else {
+        ASSERT(0); // TODO: tgsm, and other outputs for non-CS
+    }
+}
+
 struct ValueAndType {
     SpvId valueId, typeId;
 };
@@ -531,7 +542,6 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
             code.push4(SpvOpImageWrite | 4 << 16, imageId, coordId, texelValueId);
         }
         else if (dxbcInstr.tag == DxbcInstrTag::ld_uav_typed) {
-            // very similar to "ld" (SRVs)
             puts("TODO: ld_uav_typed");
             const uint numDests = 1;
             const uint numSrcs = 2; // coord, uav
@@ -543,7 +553,7 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
                 if (!(writeMask & 1u << writeCompIndex)) {
                     continue;
                 }
-                lvn.dxbcVarInfo[uint(dst.slotInFile)][writeCompIndex] = { m.GetGIntConstantId(880 + writeCompIndex), StaticSpvId_TypeGenInt32 };
+                WriteVariable(lvn, writeCompIndex, dst, m.GetGIntConstantId(880 + writeCompIndex), StaticSpvId_TypeGenInt32);
             }
         }
         else if (dxbcInstr.tag == DxbcInstrTag::imad) {
@@ -607,7 +617,7 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
                     }
                 }
                 SpvId finalVal = EmitBinOp(m, code, addOp, StaticSpvId_TypeGenInt32, productId, srcValIds[2]);
-                lvn.dxbcVarInfo[uint(dst.slotInFile)][writeCompIndex] = { finalVal, StaticSpvId_TypeGenInt32 };
+                WriteVariable(lvn, writeCompIndex, dst, finalVal, StaticSpvId_TypeGenInt32);
             } while ((wm &= wm - 1) != 0);
         }
         else if (dxbcInstr.tag == DxbcInstrTag::movc) {
@@ -625,7 +635,7 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
                 uint const otherSrcIndex = (k ^ 1) + 1;
                 srcValueIds[otherSrcIndex] = GetSrcValueWithType(m, function, code, lvn, writeCompIndex, srcs[otherSrcIndex], src_k.typeId);
                 SpvId dstValueId = EmitSelect(m, code, src_k.typeId, srcValueIds[0], srcValueIds[1], srcValueIds[2]);
-                lvn.dxbcVarInfo[uint(dst.slotInFile)][writeCompIndex] = { dstValueId, src_k.typeId };
+                WriteVariable(lvn, writeCompIndex, dst, dstValueId, src_k.typeId);
             } while ((wm &= wm - 1) != 0);
         } else {
             const uint numDests = dxbcInstr.NumDstRegs();
@@ -710,9 +720,8 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
 
                 SpvId dstValueId = EmitBinOp(m, code, op, dstTypeSpvId,
                                              srcValueIds[0], srcValueIds[1]);
-                ASSERT(dst.file == DxbcFile::temp); // TODO: graphics shaders have outputs
-                ASSERT(uint(dst.slotInFile) < lengthof(lvn.dxbcVarInfo));
-                lvn.dxbcVarInfo[uint(dst.slotInFile)][writeCompIndex] = { dstValueId, dstTypeSpvId };
+
+                WriteVariable(lvn, writeCompIndex, dst, dstValueId, dstTypeSpvId);
             }
         }
     }
