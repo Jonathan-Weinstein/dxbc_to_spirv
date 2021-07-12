@@ -25,6 +25,12 @@ struct ByteView {
     const char *end() const { return pend; }
 };
 
+static bool StartsWith(ByteView str, char_view pfx)
+{
+    return str.Length() >= pfx.length && memcmp(str.pbegin, pfx.ptr, pfx.length) == 0;
+}
+
+
 static bool EqualStrZ(ByteView view, const char *sz)
 {
     const uint len = view.Length();
@@ -56,9 +62,12 @@ static const DxbcInstrStringInfo StringTable[] = {
     { "dcl_thread_group",       DxbcInstrTag::dcl_thread_group,      DxbcInstrClass::misc_outside_function_body },
     // ...
     { "ret",                    DxbcInstrTag::ret,                   DxbcInstrClass::misc_in_function_body },
+    { "endif",                  DxbcInstrTag::endif,                 DxbcInstrClass::misc_in_function_body },
+    { "else",                   DxbcInstrTag::_else,                 DxbcInstrClass::misc_in_function_body },
     { "ld_uav_typed",           DxbcInstrTag::ld_uav_typed,          DxbcInstrClass::misc_in_function_body },
     { "ld_uav_typed_indexable", DxbcInstrTag::ld_uav_typed,          DxbcInstrClass::misc_in_function_body },
     // ...
+    { "mov",                    DxbcInstrTag::mov,                   DxbcInstrClass::dst0_assign_unary_op },
     { "not",/*no 'i' in str*/   DxbcInstrTag::inot,                  DxbcInstrClass::dst0_assign_unary_op },
     // ...
     { "and", /*no 'i' in str*/  DxbcInstrTag::iand,                  DxbcInstrClass::dst0_assign_binary_op },
@@ -69,6 +78,7 @@ static const DxbcInstrStringInfo StringTable[] = {
     { "add",                    DxbcInstrTag::add,                   DxbcInstrClass::dst0_assign_binary_op },
     { "store_uav_typed",        DxbcInstrTag::store_uav_typed,       DxbcInstrClass::dst0_assign_binary_op },
     { "ult",                    DxbcInstrTag::ult,                   DxbcInstrClass::dst0_assign_binary_op },
+    { "uge",                    DxbcInstrTag::uge,                   DxbcInstrClass::dst0_assign_binary_op },
     { "ieq",                    DxbcInstrTag::ieq,                   DxbcInstrClass::dst0_assign_binary_op },
     // ...
     { "movc",                   DxbcInstrTag::movc,                  DxbcInstrClass::dst0_assign_tri_op },
@@ -272,32 +282,63 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
         return result;
     }
 
-    const DxbcInstrStringInfo *const info = LookupInstrInfo(firstStr);
-    if (!info) {
-        Println(stderr, "unknown instruction: ", firstStr);
-        return DxbcTextScanResult::UnknownInstruction;
-    }
-
     *instr = {};
-    instr->tag = info->instrTag;
-    instr->instrClass = info->instrClass;
 
-    if (info->instrTag == DxbcInstrTag::ret) {
-        return DxbcTextScanResult::Okay;
-    }
+    int numDests;
+    int numSrcs;
 
-    int numDests = 1;
-    int numSrcs = (int)info->instrClass - (int)DxbcInstrClass::dst0_assign_unary_op + 1;
+    {
+        if (StartsWith(firstStr, "if_"_view)) {
+            if (EqualStrZ(firstStr, "if_nz")) {
+                instr->flags |= DxbcInstrFlag_nz;
+            }
+            else if (EqualStrZ(firstStr, "if_z")) {
+                // ...
+            }
+            else {
+                VERIFY(0);
+            }
 
-    if (info->instrTag == DxbcInstrTag::ld_uav_typed) {
-        numSrcs = 2;
-        // ld_uav_typed_indexable(buffer)(uint,uint,uint,uint) r1.xyzw, vThreadID.xxxx, u0.xyzw
-        if (EqualStrZ(firstStr, "ld_uav_typed_indexable")) {
-            // TODO:
-            const char *p = scanner->pSrc;
-            while (*p != '\0' && *p != ')') { ++p; } if (*p == ')') { ++p; }
-            while (*p != '\0' && *p != ')') { ++p; } if (*p == ')') { ++p; }
-            scanner->pSrc = p;
+            numDests = 0;
+            numSrcs = 1;
+
+            instr->tag = DxbcInstrTag::if_;
+            instr->instrClass = DxbcInstrClass::misc_in_function_body;
+        }
+        else {
+            const DxbcInstrStringInfo * info = LookupInstrInfo(firstStr);
+
+            if (!info) {
+                Println(stderr, "unknown instruction: ", firstStr);
+                return DxbcTextScanResult::UnknownInstruction;
+            }
+
+            numDests = 1;
+            numSrcs = (int)info->instrClass - (int)DxbcInstrClass::dst0_assign_unary_op + 1;
+
+            instr->tag = info->instrTag;
+            instr->instrClass = info->instrClass;
+
+            if (info->instrTag == DxbcInstrTag::ld_uav_typed) {
+                numSrcs = 2;
+                // ld_uav_typed_indexable(buffer)(uint,uint,uint,uint) r1.xyzw, vThreadID.xxxx, u0.xyzw
+                if (EqualStrZ(firstStr, "ld_uav_typed_indexable")) {
+                    // TODO:
+                    const char *p = scanner->pSrc;
+                    while (*p != '\0' && *p != ')') { ++p; } if (*p == ')') { ++p; }
+                    while (*p != '\0' && *p != ')') { ++p; } if (*p == ')') { ++p; }
+                    scanner->pSrc = p;
+                }
+            }
+
+            switch (info->instrTag) {
+            case DxbcInstrTag::ret:
+            case DxbcInstrTag::_else:
+            case DxbcInstrTag::endif:
+                return DxbcTextScanResult::Okay;
+            default:
+                break;
+            }
         }
     }
 
@@ -453,11 +494,13 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
         }
         else {
             // parse src swizzle and abs/neg
-            VERIFY(maskStr.Length());
-            VERIFY(srcSwizzleCharLen < 0 || srcSwizzleCharLen == maskStr.Length());
-            srcSwizzleCharLen = maskStr.Length();
+            if (numDests) {
+                VERIFY(maskStr.Length());
+                VERIFY(srcSwizzleCharLen < 0 || srcSwizzleCharLen == maskStr.Length());
+                srcSwizzleCharLen = maskStr.Length();
+            }
 
-            ASSERT(writeMaskBits);
+            ASSERT((writeMaskBits != 0) ^ (numDests == 0));
             /*
                 The textual representation of DXBC seems to have 2+ ways of doing writemasks/swizzles.
                 1. Is the "linedup" way, which is the layout in the DxbcInstruction, e.g: { dst._yz_ = src.*??* }
@@ -467,7 +510,7 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
                 To distinguish between these 2 modes in the dsbc text, my current idea is to choose mode 2 (glsl)
                 when the string-length of the writemask is the same as the string-length of the swizzles.
             */
-            bool const bModeGLSL = (writeMaskCharLen == srcSwizzleCharLen);
+            bool const bModeGLSL = (writeMaskCharLen == srcSwizzleCharLen) && numDests;
             uint swizzle = 0;
             if (bModeGLSL) {
                 uint tmpWriteMask = writeMaskBits;
@@ -484,8 +527,9 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
                 } while (tmpWriteMask);
             } else {
                 // example: and r0.yz, vThreadID.xxxx, l(0, 4, 2, 0)
+                // if_nz r0.y
                 uint i = 0;
-                VERIFY(maskStr.Length() == 4); // hmm, think this should be the case.
+                VERIFY(numDests == 0 || maskStr.Length() == 4); // hmm, think this should be the case.
                 for (char ch : maskStr) {
                     uint comp = LetterToCompIndex(ch);
                     VERIFY(comp < 4u);

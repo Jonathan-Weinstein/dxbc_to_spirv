@@ -351,6 +351,7 @@ static SpirvOpInfo GetSpirvOpInfo(DxbcInstrTag dxbcTag)
     case DxbcInstrTag::iadd: return { SpvOpIAdd, SpirvOpClass::int_common };
     case DxbcInstrTag::add: return { SpvOpFAdd, SpirvOpClass::float_common };
     case DxbcInstrTag::movc: return { SpvOpSelect, SpirvOpClass::select_generic };
+    case DxbcInstrTag::uge: return { SpvOpUGreaterThanEqual, SpirvOpClass::int_cmp };
     case DxbcInstrTag::ult: return { SpvOpULessThan, SpirvOpClass::int_cmp };
     case DxbcInstrTag::ieq: return { SpvOpIEqual, SpirvOpClass::int_cmp };
     case DxbcInstrTag::ishl: return { SpvOpShiftLeftLogical, SpirvOpClass::int_common };
@@ -530,6 +531,18 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
         if (dxbcInstr.tag == DxbcInstrTag::ret) {
             code.push(SpvOpReturn | 1u << 16);
             break;
+        }
+        else if (dxbcInstr.tag == DxbcInstrTag::if_) {
+            printf("got if, nz? %d, fullSrcComp=%c\n", dxbcInstr.flags & DxbcInstrFlag_nz, "xyzw"[dxbcInstr.operands[0].srcSwizzle[0]]);
+        }
+        else if (dxbcInstr.tag == DxbcInstrTag::_else) {
+            puts("got _else, but should handle this on revusrive return form if_");
+        }
+        else if (dxbcInstr.tag == DxbcInstrTag::endif) {
+            puts("got endif");
+        }
+        else if (dxbcInstr.tag == DxbcInstrTag::mov) {
+            puts("got mov");
         }
         else if (dxbcInstr.tag == DxbcInstrTag::store_uav_typed) {
             puts("TODO: store_uav_typed without assuming RWBuffer<uint>:register(u0)");
@@ -1056,5 +1069,52 @@ ret
 
     DxbcTextToSpirvFile(MiscDxbcText, "Flt.spv");
 #endif
+
+#if 1
+    static const char IfElseDxbcText[] = R"(cs_5_0
+dcl_globalFlags refactoringAllowed
+dcl_uav_typed_buffer (uint,uint,uint,uint) u0
+dcl_input vThreadIDInGroupFlattened
+dcl_input vThreadID.xyz
+dcl_temps 1
+dcl_thread_group 8, 4, 2
+uge r0.x, vThreadID.x, l(4)
+if_nz r0.x
+  if_z vThreadID.z
+    iadd r0.x, -vThreadID.y, vThreadID.x
+    ult r0.y, vThreadID.y, l(2)
+    if_nz r0.y
+      ishl r0.x, r0.x, l(2)
+    endif
+  else
+    xor r0.x, vThreadID.y, vThreadID.x
+  endif
+  iadd r0.y, r0.x, l(5)
+  if_z vThreadID.y
+    iadd r0.x, r0.x, l(12)
+  else
+    xor r0.x, r0.y, l(255)
+  endif
+else
+  ult r0.y, vThreadID.y, l(2)
+  if_nz r0.y
+    and r0.y, vThreadID.x, l(1)
+    if_z r0.y
+      iadd r0.x, vThreadID.x, l(100)
+    else
+      mov r0.x, vThreadID.x
+    endif
+  else
+    mov r0.x, l(42)
+  endif
+endif
+store_uav_typed u0.xyzw, vThreadIDInGroupFlattened.xxxx, r0.xxxx
+ret
+)";
+
+    DxbcTextToSpirvFile(IfElseDxbcText, "branch.spv");
+#endif
+
+
     return 0;
 }

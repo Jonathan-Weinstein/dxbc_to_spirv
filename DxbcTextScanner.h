@@ -54,7 +54,9 @@ enum class DxbcInstrTag : uint8_t {
     dcl_thread_group,
     ret,
     ult,
+    uge,
     ieq,
+    mov,
     movc,
     ior,
     iand,
@@ -66,6 +68,9 @@ enum class DxbcInstrTag : uint8_t {
     add, // flt
     store_uav_typed,
     ld_uav_typed,
+    if_,
+    _else,
+    endif,
 };
 
 enum {
@@ -86,9 +91,14 @@ struct DxbcOperand {
     } immediateValue; // maybe shouldn't be here, the slot could be an index into an array.
 };
 
+enum {
+    DxbcInstrFlag_nz = 1<<0 // if false, negate condition/label order for { breakc, continuec, if }
+};
+
 struct DxbcInstruction {
     DxbcInstrTag tag;
     DxbcInstrClass instrClass;
+    uint8_t flags;
     DxbcOperand operands[4];
 
     uint NumDstRegs() const
