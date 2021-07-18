@@ -288,8 +288,13 @@ DxbcText_ScanInstrInFuncBody(DxbcTextScanner *scanner, DxbcInstruction *instr)
     int numSrcs;
 
     {
+        if (EqualStrZ(firstStr, "if")) {
+            goto L_if_nz;
+        }
+
         if (StartsWith(firstStr, "if_"_view)) {
             if (EqualStrZ(firstStr, "if_nz")) {
+            L_if_nz:
                 instr->flags |= DxbcInstrFlag_nz;
             }
             else if (EqualStrZ(firstStr, "if_z")) {

@@ -137,6 +137,9 @@ struct Module {
 
     SpvId ptr_vThreadIDInGroupFlattened_id = 0;
 
+    uint debugLoadTypedValueBase = 0;
+
+
     SpvId GetBound() const { return _bound; }
 
 
@@ -365,7 +368,7 @@ static SpirvOpInfo GetSpirvOpInfo(DxbcInstrTag dxbcTag)
 
 
 
-struct DxbcComponentVarInfo {
+struct PackedValueAndType {
     unsigned spvValueId : 24, spvStaticTypeId : 8;
 };
 
@@ -377,26 +380,26 @@ struct DxbcComponentVarInfo {
 //
 // The more helpful part is associating dxbc vars with a value, so don't have to do
 // a bunch of OpLoad/OpStore in the middle of a basic block.
-struct LvnContext {
-    DxbcComponentVarInfo dxbcVarInfo[256][4] = { }; // 4 components per reg. XXX: max temp regs is 4096
+struct VariableEnv {
+    PackedValueAndType varArrayMap[256][4] = { }; // 4 components per reg. XXX: max temp regs is 4096
 
     SpvId CurrentTypeIdOfTempVar(uint writeMaskComp, const DxbcOperand& src) const
     {
         ASSERT(src.file == DxbcFile::temp);
         uint comp = src.srcSwizzle[writeMaskComp];
-        return dxbcVarInfo[src.slotInFile][comp].spvStaticTypeId;
+        return varArrayMap[src.slotInFile][comp].spvStaticTypeId;
     }
 };
 
-static void WriteVariable(LvnContext &lvn, uint comp, const DxbcOperand& dst, SpvId valueId, SpvId typeId)
+static void WriteVariable(VariableEnv &env, uint comp, const DxbcOperand& dst, SpvId valueId, SpvId typeId)
 {
     ASSERT(uint(typeId) < StaticSpvId_End);
     if (dst.file == DxbcFile::temp) {
         ASSERT(comp < 4u);
         uint const slot = uint(dst.slotInFile);
-        ASSERT(slot < lengthof(lvn.dxbcVarInfo));
+        ASSERT(slot < lengthof(env.varArrayMap));
         // and mark "dirty" by chaning from nonzero
-        lvn.dxbcVarInfo[slot][comp] = { valueId, typeId };
+        env.varArrayMap[slot][comp] = { valueId, typeId };
     }
     else {
         ASSERT(0); // TODO: tgsm, and other outputs for non-CS
@@ -408,8 +411,8 @@ struct ValueAndType {
 };
 
 static ValueAndType
-GetCurrentValueNoAbsNeg(Module& m, Function& function, SpirvDynamicArray& code, LvnContext& lvn,
-    uint writeMaskComp, const DxbcOperand& src, SpvId immediateTypeId = StaticSpvId_TypeGenInt32)
+GetCurrentValueNoAbsNeg(Module& m, Function& function, SpirvDynamicArray& code, VariableEnv& env,
+    uint writeMaskComp, const DxbcOperand& src, SpvId immediateTypeId = StaticSpvId_TypeGenInt32) // hmm, sometimes float would be preferred.
 {
     ASSERT(immediateTypeId < (uint)StaticSpvId_End);
 
@@ -419,7 +422,7 @@ GetCurrentValueNoAbsNeg(Module& m, Function& function, SpirvDynamicArray& code, 
     SpvId typeId;
 
     if (src.file == DxbcFile::temp) {
-        DxbcComponentVarInfo var = lvn.dxbcVarInfo[src.slotInFile][srcComponentIndex];
+        PackedValueAndType var = env.varArrayMap[src.slotInFile][srcComponentIndex];
         ASSERT(var.spvValueId);
         valueId = var.spvValueId;
         typeId = var.spvStaticTypeId;
@@ -449,10 +452,10 @@ GetCurrentValueNoAbsNeg(Module& m, Function& function, SpirvDynamicArray& code, 
 
 
 static SpvId
-GetSrcValueWithType(Module& m, Function& function, SpirvDynamicArray& code, LvnContext& lvn,
+GetSrcValueWithType(Module& m, Function& function, SpirvDynamicArray& code, VariableEnv& env,
                     uint writeMaskComp, const DxbcOperand& src, SpvId desiredTypeId)
 {
-    ValueAndType const current = GetCurrentValueNoAbsNeg(m, function, code, lvn, writeMaskComp, src, desiredTypeId);
+    ValueAndType const current = GetCurrentValueNoAbsNeg(m, function, code, env, writeMaskComp, src, desiredTypeId);
     SpvId typeId = current.typeId;
     SpvId valueId = current.valueId;
 
@@ -504,7 +507,7 @@ GetSrcValueWithType(Module& m, Function& function, SpirvDynamicArray& code, LvnC
 
 
 static bool
-IsCurrentTypeBool(const LvnContext& lvn, uint writeCompIndex, const DxbcOperand& src)
+IsCurrentTypeBool(const VariableEnv& lvn, uint writeCompIndex, const DxbcOperand& src)
 {
     return src.file == DxbcFile::temp && lvn.CurrentTypeIdOfTempVar(writeCompIndex, src) == StaticSpvId_TypeBool;
 }
@@ -517,7 +520,7 @@ static void
 Codegen(Module& m, Function& function, SpirvDynamicArray& code,
         DxbcTextScanner *scanner, DxbcInstruction& dxbcInstr)
 {
-    LvnContext lvn;
+    VariableEnv env;
 
     while (!DxbcText_ScanIsEof(scanner)) {    
         DxbcTextScanResult scanResult = DxbcText_ScanInstrInFuncBody(scanner, &dxbcInstr);
@@ -542,16 +545,25 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
             puts("got endif");
         }
         else if (dxbcInstr.tag == DxbcInstrTag::mov) {
-            puts("got mov");
+            uint const writeMask = dxbcInstr.operands[0].dstWritemask;
+            for (uint writeCompIndex = 0; writeCompIndex < 4u; ++writeCompIndex) {
+                if (!(writeMask & 1u << writeCompIndex)) {
+                    continue;
+                }
+                ValueAndType const src = GetCurrentValueNoAbsNeg(m, function, code, env, writeCompIndex, dxbcInstr.operands[1]);
+                WriteVariable(env, writeCompIndex, dxbcInstr.operands[0], src.valueId, src.typeId);
+            }
         }
         else if (dxbcInstr.tag == DxbcInstrTag::store_uav_typed) {
             puts("TODO: store_uav_typed without assuming RWBuffer<uint>:register(u0)");
             SpvId imageId = m.AllocId();
             code.push4(SpvOpLoad | 4 << 16, m.uav_image_type_ids[0], imageId, m.ptr_uav_ids[0]);
-            SpvId coordId = GetSrcValueWithType(m, function, code, lvn,
+            SpvId coordId = GetSrcValueWithType(m, function, code, env,
                 0, dxbcInstr.operands[1], StaticSpvId_TypeGenInt32);
-            SpvId texelValueId = GetSrcValueWithType(m, function, code, lvn,
-                0, dxbcInstr.operands[2], StaticSpvId_TypeGenInt32);
+            uint const imageSampledTypeId = StaticSpvId_TypeGenInt32; // XXX, could be float
+            SpvId texelValueId = GetSrcValueWithType(m, function, code, env,
+                0, dxbcInstr.operands[2], imageSampledTypeId);
+            // XXX: write whole swizzled 4-comp value:
             code.push4(SpvOpImageWrite | 4 << 16, imageId, coordId, texelValueId);
         }
         else if (dxbcInstr.tag == DxbcInstrTag::ld_uav_typed) {
@@ -562,11 +574,12 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
             const DxbcOperand& dst = dxbcInstr.operands[0];
             const uint writeMask = dst.dstWritemask;
             ASSERT(writeMask);
+            const uint base = ++m.debugLoadTypedValueBase * 1000;
             for (uint writeCompIndex = 0; writeCompIndex < 4u; ++writeCompIndex) {
                 if (!(writeMask & 1u << writeCompIndex)) {
                     continue;
                 }
-                WriteVariable(lvn, writeCompIndex, dst, m.GetGIntConstantId(880 + writeCompIndex), StaticSpvId_TypeGenInt32);
+                WriteVariable(env, writeCompIndex, dst, m.GetGIntConstantId(base + writeCompIndex), StaticSpvId_TypeGenInt32);
             }
         }
         else if (dxbcInstr.tag == DxbcInstrTag::imad) {
@@ -619,7 +632,7 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
                     mulOp = SpvOpShiftLeftLogical;
                 }
                 SpvId srcValIds[3]; for (int i = 0; i < 3; ++i) {
-                    srcValIds[i] = GetSrcValueWithType(m, function, code, lvn, writeCompIndex, srcs[i], StaticSpvId_TypeGenInt32);
+                    srcValIds[i] = GetSrcValueWithType(m, function, code, env, writeCompIndex, srcs[i], StaticSpvId_TypeGenInt32);
                 }
                 SpvId productId = EmitBinOp(m, code, mulOp, StaticSpvId_TypeGenInt32, srcValIds[0], srcValIds[1]);
                 SpvOp addOp = SpvOpIAdd;
@@ -630,7 +643,7 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
                     }
                 }
                 SpvId finalVal = EmitBinOp(m, code, addOp, StaticSpvId_TypeGenInt32, productId, srcValIds[2]);
-                WriteVariable(lvn, writeCompIndex, dst, finalVal, StaticSpvId_TypeGenInt32);
+                WriteVariable(env, writeCompIndex, dst, finalVal, StaticSpvId_TypeGenInt32);
             } while ((wm &= wm - 1) != 0);
         }
         else if (dxbcInstr.tag == DxbcInstrTag::movc) {
@@ -641,14 +654,14 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
             do {
                 uint const writeCompIndex = bsf(wm);
                 uint const k = (srcs[1].file != DxbcFile::immediate) ? 0 : 1; // src[k + 1] decides the dest type
-                ValueAndType const src_k = GetCurrentValueNoAbsNeg(m, function, code, lvn, writeCompIndex, srcs[k+1]);
+                ValueAndType const src_k = GetCurrentValueNoAbsNeg(m, function, code, env, writeCompIndex, srcs[k+1]);
                 SpvId srcValueIds[3];
-                srcValueIds[0] = GetSrcValueWithType(m, function, code, lvn, writeCompIndex, srcs[0], StaticSpvId_TypeBool);
+                srcValueIds[0] = GetSrcValueWithType(m, function, code, env, writeCompIndex, srcs[0], StaticSpvId_TypeBool);
                 srcValueIds[k+1] = src_k.valueId;
                 uint const otherSrcIndex = (k ^ 1) + 1;
-                srcValueIds[otherSrcIndex] = GetSrcValueWithType(m, function, code, lvn, writeCompIndex, srcs[otherSrcIndex], src_k.typeId);
+                srcValueIds[otherSrcIndex] = GetSrcValueWithType(m, function, code, env, writeCompIndex, srcs[otherSrcIndex], src_k.typeId);
                 SpvId dstValueId = EmitSelect(m, code, src_k.typeId, srcValueIds[0], srcValueIds[1], srcValueIds[2]);
-                WriteVariable(lvn, writeCompIndex, dst, dstValueId, src_k.typeId);
+                WriteVariable(env, writeCompIndex, dst, dstValueId, src_k.typeId);
             } while ((wm &= wm - 1) != 0);
         } else {
             const uint numDests = dxbcInstr.NumDstRegs();
@@ -710,8 +723,8 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
                 }
                 else if (const SpvOp boolSpvOp = spvOpInfo.BoolLogicOpOfBitwiseIntOp()) { 
                     /* Prefer leaving stuff in bools if the next op can be done using bools: */
-                    if (IsCurrentTypeBool(lvn, writeCompIndex, srcs[0]) && 
-                        IsCurrentTypeBool(lvn, writeCompIndex, srcs[1])) {
+                    if (IsCurrentTypeBool(env, writeCompIndex, srcs[0]) && 
+                        IsCurrentTypeBool(env, writeCompIndex, srcs[1])) {
                         
                         dstTypeSpvId = StaticSpvId_TypeBool;
                         srcTypeSpvId = StaticSpvId_TypeBool;
@@ -721,7 +734,7 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
 
                 /* fetch srcs: */
                 for (uint srcIndex = 0; srcIndex < numSrcs; ++srcIndex) {
-                    srcValueIds[srcIndex] = GetSrcValueWithType(m, function, code, lvn, writeCompIndex,
+                    srcValueIds[srcIndex] = GetSrcValueWithType(m, function, code, env, writeCompIndex,
                                                                 srcs[srcIndex], srcTypeSpvId);
                 }
 
@@ -734,7 +747,7 @@ Codegen(Module& m, Function& function, SpirvDynamicArray& code,
                 SpvId dstValueId = EmitBinOp(m, code, op, dstTypeSpvId,
                                              srcValueIds[0], srcValueIds[1]);
 
-                WriteVariable(lvn, writeCompIndex, dst, dstValueId, dstTypeSpvId);
+                WriteVariable(env, writeCompIndex, dst, dstValueId, dstTypeSpvId);
             }
         }
     }
